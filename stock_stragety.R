@@ -1,156 +1,215 @@
 # ==============================================================================
-# 课题名称：基于R语言的A股/美股双均线交易策略回测分析
-# 数据来源：本地文件 "aapl_us_2025.csv" (真实历史数据)
+# 课题名称：基于参数网格搜索与多因子过滤的稳健双均线策略 (修复版 V3)
+# 修复说明：
+# 1. 修复 Sharpe Ratio 提取失败的问题
+# 2. 增加对“无交易/无结果”情况的防御性检查
+# 3. 动态设定时间窗口：自动获取最近 5 年的数据进行分析
+# 4. [新增] 自动保存热力图为 'grid.png'
 # ==============================================================================
 
-# 1. 加载必要的包
+# 1. 环境准备
+# ------------------------------------------------------------------------------
+# 辅助函数：自动安装并加载包
+ensure_package <- function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    if (!require(pkg, character.only = TRUE)) stop(paste("无法安装包:", pkg))
+  }
+}
+
+ensure_package("quantmod")
+ensure_package("TTR")
+ensure_package("ggplot2")
+ensure_package("PerformanceAnalytics")
+ensure_package("scales")
+ensure_package("reshape2") 
+
 library(quantmod)
 library(TTR)
 library(ggplot2)
 library(PerformanceAnalytics)
-library(scales) 
-
-# 2. 设定参数
-stock_code   <- "AAPL"
-short_period <- 20          # 短期均线 (20天)
-long_period  <- 60          # 长期均线 (60天)
-csv_file     <- "aapl_us_2025.csv" # 你上传的文件名
-
-# 设置时间范围：最近5年 (2020年 - 2024/2025年)
-# 这样可以过滤掉 1984 年那些太久远的数据
-start_date   <- "2020-01-01" 
+library(scales)
+library(reshape2)
 
 # ==============================================================================
-# 第一阶段：读取并清洗数据
+# 2. 数据获取与预处理 (动态 5 年)
 # ==============================================================================
+stock_code <- "AAPL"
+csv_file   <- "aapl_us_2025.csv"
 
-# 尝试自动设置工作目录到脚本所在位置
-try({
-  current_path <- dirname(rstudioapi::getSourceEditorContext()$path)
-  setwd(current_path)
-  cat(paste("工作目录已设置:", current_path, "\n"))
-}, silent = TRUE)
+# 动态计算开始时间：当前日期减去 5 年 (365 * 5)
+end_date   <- Sys.Date()
+start_date <- end_date - (365 * 5)
 
-cat(paste(">>> 正在读取文件:", csv_file, "...\n"))
+cat(sprintf(">>> 分析时间段: %s 至 %s (最近5年)\n", start_date, end_date))
 
-if (!file.exists(csv_file)) {
-  stop(paste("错误：找不到文件", csv_file, "\n请确保该 CSV 文件和此 R 脚本在同一个文件夹内。"))
+# 尝试读取数据，如果不存在则下载
+if (file.exists(csv_file)) {
+  raw_data <- read.csv(csv_file)
+  raw_data$Date <- as.Date(raw_data$Date)
+  stock_data <- xts(raw_data[, c("Open", "High", "Low", "Close", "Volume")], order.by = raw_data$Date)
+} else {
+  message("本地文件不存在，正在下载 AAPL 数据...")
+  tryCatch({
+    getSymbols("AAPL", from = start_date, to = end_date)
+    stock_data <- AAPL
+    names(stock_data) <- c("Open", "High", "Low", "Close", "Volume", "Adjusted")
+  }, error = function(e) {
+    stop("无法下载数据。请检查网络或确认 'aapl_us_2025.csv' 文件是否存在。")
+  })
 }
 
-# 读取 CSV
-raw_data <- read.csv(csv_file)
-
-# 1. 转换日期格式
-raw_data$Date <- as.Date(raw_data$Date)
-
-# 2. 转换为 xts 时间序列对象
-# 这里的 CSV 只有 Close 列，没有 Adj Close，直接用 Close
-stock_data <- xts(raw_data[, c("Open", "High", "Low", "Close", "Volume")], order.by = raw_data$Date)
-
-# 3. 截取最近 5 年的数据
-# xts 支持直接用字符串范围筛选，例如 "2020-01-01/" 表示从这一天直到最后
+# 确保数据只包含最近 5 年 (针对本地文件可能包含更久数据的情况)
 stock_data <- stock_data[paste0(start_date, "/")]
 
-cat(paste(">>> 数据加载成功！\n"))
-cat(paste(">>> 时间范围:", start(stock_data), "至", end(stock_data), "\n"))
-cat(paste(">>> 总交易日数:", nrow(stock_data), "\n"))
-
-# 提取收盘价用于策略
-price <- stock_data$Close
-names(price) <- "Close"
+# 统一使用收盘价
+price <- Cl(stock_data)
+# 计算基准收益（买入持有）
+buy_hold_ret <- ROC(price, type = "discrete")
+buy_hold_ret[is.na(buy_hold_ret)] <- 0
 
 # ==============================================================================
-# 第二阶段：策略构建
+# 3. 核心策略函数 (封装化，便于循环调用)
 # ==============================================================================
-
-# 1. 计算均线
-sma_short <- SMA(price, n = short_period)
-sma_long  <- SMA(price, n = long_period)
-
-# 合并数据
-strategy_df <- merge(price, sma_short, sma_long)
-colnames(strategy_df) <- c("Close", "SMA_Short", "SMA_Long")
-strategy_df <- na.omit(strategy_df) # 去除计算初期的 NA
-
-# 2. 生成信号
-# 仓位逻辑: 短线 > 长线 = 持有(1)，否则空仓(0)
-strategy_df$Position <- ifelse(strategy_df$SMA_Short > strategy_df$SMA_Long, 1, 0)
-
-# 交易信号: 仓位变化 (1=买入, -1=卖出)
-strategy_df$Signal <- diff(strategy_df$Position)
-strategy_df$Signal[1] <- 0
-
-# ==============================================================================
-# 第三阶段：回测与评估
-# ==============================================================================
-
-# 1. 计算基准收益 (Buy & Hold)
-daily_ret <- ROC(strategy_df$Close, type = "discrete")
-daily_ret[1] <- 0 
-
-# 2. 计算策略收益 (T+1 交易机制)
-# Lag(Position, 1) 模拟“次日开盘操作”，即今天的收益取决于昨天的信号
-strategy_ret <- Lag(strategy_df$Position, k = 1) * daily_ret
-strategy_ret[is.na(strategy_ret)] <- 0 
-
-# 合并对比
-ret_comp <- merge(daily_ret, strategy_ret)
-colnames(ret_comp) <- c("Benchmark", "Strategy")
-
-# 3. 输出绩效表
-cat("\n=== 策略绩效评估 (最近5年) ===\n")
-print(table.AnnualizedReturns(ret_comp))
-cat("\n=== 最大回撤 ===\n")
-print(maxDrawdown(ret_comp))
+run_strategy <- function(price_data, short_p, long_p, use_rsi_filter = FALSE) {
+  
+  # 必须保证长周期大于短周期，且参数不为 NA
+  if (is.na(short_p) || is.na(long_p) || short_p >= long_p) return(NULL)
+  
+  # 1. 计算技术指标
+  sma_short <- SMA(price_data, n = short_p)
+  sma_long  <- SMA(price_data, n = long_p)
+  rsi       <- RSI(price_data, n = 14)
+  
+  # 2. 生成基础信号 (1=持有, 0=空仓)
+  signal <- ifelse(sma_short > sma_long, 1, 0)
+  
+  # 3. 应用 RSI 过滤器 (进阶逻辑)
+  if (use_rsi_filter) {
+    filter_condition <- ifelse(rsi < 75, 1, 0) # RSI < 75 才持有，防止高位接盘
+    signal <- signal * filter_condition
+  }
+  
+  # 处理 NA
+  signal[is.na(signal)] <- 0
+  
+  # 4. 计算策略收益
+  daily_ret <- ROC(price_data, type = "discrete")
+  daily_ret[is.na(daily_ret)] <- 0
+  
+  strategy_ret <- Lag(signal, k = 1) * daily_ret
+  strategy_ret[is.na(strategy_ret)] <- 0
+  
+  return(strategy_ret)
+}
 
 # ==============================================================================
-# 第四阶段：可视化
+# 4. 深度模块：参数网格搜索 (Grid Search)
 # ==============================================================================
+cat(">>> 开始执行参数网格搜索 (寻找最优均线组合)...\n")
+cat(">>> 这可能需要一点时间，请耐心等待...\n")
 
-# 准备绘图数据
-df_plot <- data.frame(Date = index(strategy_df), coredata(strategy_df))
+short_range <- seq(5, 40, by = 5)   
+long_range  <- seq(30, 100, by = 10) 
 
-# 图1: 交易信号图
-p1 <- ggplot(df_plot, aes(x = Date)) +
-  geom_line(aes(y = Close, color = "Price"), linewidth = 0.5, alpha = 0.6) +
-  geom_line(aes(y = SMA_Short, color = "SMA20"), linewidth = 0.8) +
-  geom_line(aes(y = SMA_Long, color = "SMA60"), linewidth = 0.8) +
-  # 买入点 (红色正三角)
-  geom_point(data = subset(df_plot, Signal == 1),
-             aes(y = SMA_Short), shape = 17, color = "red", size = 3) +
-  # 卖出点 (绿色倒三角)
-  geom_point(data = subset(df_plot, Signal == -1),
-             aes(y = SMA_Short), shape = 25, color = "green", size = 3, fill="green") +
-  scale_color_manual(values = c("Price" = "gray50", "SMA20" = "orange", "SMA60" = "blue")) +
-  labs(title = paste("双均线策略交易信号图 -", stock_code),
-       subtitle = "红色三角=买入(金叉), 绿色倒三角=卖出(死叉)",
-       y = "价格", x = "日期") +
+results_matrix <- matrix(NA, nrow = length(short_range), ncol = length(long_range))
+rownames(results_matrix) <- short_range
+colnames(results_matrix) <- long_range
+
+for (i in 1:length(short_range)) {
+  for (j in 1:length(long_range)) {
+    s_p <- short_range[i]
+    l_p <- long_range[j]
+    
+    if (s_p < l_p) {
+      strat_ret <- run_strategy(price, s_p, l_p, use_rsi_filter = TRUE)
+      
+      if (!is.null(strat_ret) && any(strat_ret != 0)) {
+        perf <- table.AnnualizedReturns(strat_ret)
+        # [Fix] 健壮地查找 Sharpe Ratio 行
+        sharpe_row_idx <- grep("Sharpe", rownames(perf))
+        if (length(sharpe_row_idx) > 0) {
+           results_matrix[i, j] <- perf[sharpe_row_idx[1], 1]
+        } else {
+           results_matrix[i, j] <- perf[3, 1]
+        }
+      }
+    }
+  }
+}
+
+# ==============================================================================
+# 5. 结果可视化：参数性能热力图 (自动保存)
+# ==============================================================================
+melted_cormat <- melt(results_matrix, na.rm = TRUE)
+
+if (nrow(melted_cormat) == 0) {
+  stop("错误：网格搜索未产生任何有效结果。可能是数据问题导致所有策略均无交易或夏普比率计算失败。")
+}
+
+colnames(melted_cormat) <- c("Short_Period", "Long_Period", "Sharpe_Ratio")
+
+p_heatmap <- ggplot(data = melted_cormat, aes(x = as.factor(Long_Period), y = as.factor(Short_Period), fill = Sharpe_Ratio)) +
+  geom_tile() +
+  scale_fill_gradient(low = "#f7fbff", high = "#08306b", name = "夏普比率") +
   theme_minimal() +
-  theme(legend.title = element_blank(), legend.position = "top")
+  labs(title = "策略参数热力图 (近5年)：寻找最优均线组合",
+       subtitle = "颜色越深代表夏普比率越高",
+       x = "长期均线周期",
+       y = "短期均线周期")
 
-print(p1)
+# 1. 在屏幕上显示
+print(p_heatmap)
 
-# 图2: 累计收益对比图
-# 计算累计收益
-cum_ret_benchmark <- cumprod(1 + ret_comp$Benchmark) - 1
-cum_ret_strategy  <- cumprod(1 + ret_comp$Strategy) - 1
+# 2. 保存到本地文件 (新增功能)
+ggsave("grid.png", plot = p_heatmap, width = 8, height = 6, dpi = 300)
+cat(">>> [成功] 热力图已保存为 'grid.png'。\n")
+cat(">>> 热力图已生成。请查看 Plot 面板或当前目录下的图片文件。\n")
 
-df_ret_plot <- data.frame(Date = index(cum_ret_benchmark), 
-                          Benchmark = coredata(cum_ret_benchmark),
-                          Strategy = coredata(cum_ret_strategy))
+# ==============================================================================
+# 6. 最优策略回测与深度对比
+# ==============================================================================
 
-p2 <- ggplot(df_ret_plot, aes(x = Date)) +
-  geom_line(aes(y = Benchmark, color = "基准 (买入持有)"), linewidth = 1) +
-  geom_line(aes(y = Strategy, color = "双均线策略"), linewidth = 1) +
-  geom_area(aes(y = Strategy), fill = "blue", alpha = 0.1) + # 蓝色阴影填充
-  scale_y_continuous(labels = percent) +
-  scale_color_manual(values = c("基准 (买入持有)" = "gray", "双均线策略" = "red")) +
-  labs(title = paste("策略收益 vs 基准收益 -", stock_code),
-       subtitle = "累计收益率对比 (最近5年)",
-       y = "累计收益率", x = "日期") +
-  theme_minimal() +
-  theme(legend.title = element_blank(), legend.position = "top")
+if (all(is.na(results_matrix))) {
+  stop("错误：无法找到最优参数。所有组合的夏普比率均为 NA。")
+}
 
-print(p2)
+best_idx <- which(results_matrix == max(results_matrix, na.rm = TRUE), arr.ind = TRUE)
 
-cat("\nDone\n")
+best_short <- short_range[best_idx[1, 1]]
+best_long  <- long_range[best_idx[1, 2]]
+
+cat(sprintf("\n>>> 搜索完成！最优参数组合：短期=%d, 长期=%d\n", best_short, best_long))
+
+# 运行对比
+ret_default <- run_strategy(price, 20, 60, use_rsi_filter = FALSE)
+ret_opt     <- run_strategy(price, best_short, best_long, use_rsi_filter = FALSE)
+ret_filter  <- run_strategy(price, best_short, best_long, use_rsi_filter = TRUE)
+
+compare_all <- merge(ret_default, ret_opt, ret_filter, buy_hold_ret)
+colnames(compare_all) <- c("Default(20/60)", "Optimized_MA", "Optimized+RSI", "Benchmark")
+compare_all <- na.omit(compare_all)
+
+# ==============================================================================
+# 7. 生成专业绩效报告
+# ==============================================================================
+
+cat("\n=======================================================\n")
+cat("               策略最终绩效报告 (Performance)            \n")
+cat("=======================================================\n")
+
+# 显示并保存累积收益图
+charts.PerformanceSummary(compare_all, 
+                          main = "策略深度对比：默认 vs 优化参数 vs 复合策略",
+                          colorset = c("gray", "blue", "red", "green"),
+                          lwd = 2)
+
+# 如果想保存绩效图，也可以使用 jpeg/png 函数包裹
+# png("performance_summary.png", width=800, height=600)
+# charts.PerformanceSummary(...)
+# dev.off()
+
+stats_table <- table.AnnualizedReturns(compare_all)
+print(stats_table)
+
+cat("\n>>> 分析完成。\n")
